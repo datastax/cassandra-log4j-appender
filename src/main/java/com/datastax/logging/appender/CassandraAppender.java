@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -14,6 +15,9 @@ import org.apache.cassandra.thrift.Column;
 import org.apache.cassandra.thrift.CfDef;
 import org.apache.cassandra.thrift.ColumnOrSuperColumn;
 import org.apache.cassandra.thrift.ConsistencyLevel;
+import org.apache.cassandra.thrift.Compression;
+import org.apache.cassandra.thrift.CqlResult;
+import org.apache.cassandra.thrift.CqlPreparedResult;
 import org.apache.cassandra.thrift.ITransportFactory;
 import org.apache.cassandra.thrift.KsDef;
 import org.apache.cassandra.thrift.Mutation;
@@ -38,6 +42,7 @@ public class CassandraAppender extends AppenderSkeleton
     private static final ObjectMapper jsonMapper = new ObjectMapper();
 
     // CF column names
+    public static final String ID = "id";
     public static final String HOST_IP = "host_ip";
     public static final String HOST_NAME = "host_name";
     public static final String APP_NAME  = "app_name";
@@ -90,7 +95,8 @@ public class CassandraAppender extends AppenderSkeleton
 
     private AtomicBoolean clientInitialized = new AtomicBoolean(false);
     private Cassandra.Iface client;
-    
+    private boolean useCql3 = false;
+
     private static final String ip = getIP();
     private static final String hostname = getHostName();
 
@@ -248,13 +254,63 @@ public class CassandraAppender extends AppenderSkeleton
         {
             initClient();
         }
-        
-        ByteBuffer rowId = toByteBuffer(UUID.randomUUID());
-        Map<String, List<Mutation>> mutMap = new HashMap<String, List<Mutation>>();
-        mutMap.put(columnFamily, createMutationList(event));
-        rowBuffer.put(rowId, mutMap);
 
-        flushIfNecessary();
+        if(useCql3)
+        {
+            Cql3QueryBuilder qb = new Cql3QueryBuilder(keyspaceName, columnFamily);
+
+            qb.add(ID, UUID.randomUUID());
+            qb.add(APP_NAME, appName);
+            qb.add(HOST_IP, ip);
+            qb.add(HOST_NAME, hostname);
+            qb.add(LOGGER_NAME, event.getLoggerName());
+            qb.add(LEVEL, event.getLevel().toString());
+            qb.add(MESSAGE, event.getRenderedMessage());
+            qb.add(NDC, event.getNDC());
+            qb.add(APP_START_TIME, LoggingEvent.getStartTime());
+            qb.add(THREAD_NAME, event.getThreadName());
+            qb.add(TIMESTAMP, event.getTimeStamp());
+
+            LocationInfo locInfo = event.getLocationInformation();
+            if (locInfo != null)
+            {
+                qb.add(CLASS_NAME, locInfo.getClassName());
+                qb.add(FILE_NAME, locInfo.getFileName());
+                qb.add(LINE_NUMBER, locInfo.getLineNumber());
+                qb.add(METHOD_NAME, locInfo.getMethodName());
+            }
+
+            String[] throwableStrs = event.getThrowableStrRep();
+            if (throwableStrs != null)
+            {
+                StringBuilder builder = new StringBuilder();
+                for (String throwableStr : throwableStrs)
+                {
+                    builder.append(throwableStr);
+                }
+
+                qb.add(THROWABLE_STR, builder.toString());
+            }
+
+            try
+            {
+                String query = qb.build();
+                client.execute_cql3_query(toByteBuffer(query), Compression.NONE, consistencyLevelWrite);
+            }
+            catch (Exception e)
+            {
+                System.out.println(e.toString());
+
+            }
+        }
+        else
+        {
+            ByteBuffer rowId = toByteBuffer(UUID.randomUUID());
+            Map<String, List<Mutation>> mutMap = new HashMap<String, List<Mutation>>();
+            mutMap.put(columnFamily, createMutationList(event));
+            rowBuffer.put(rowId, mutMap);
+            flushIfNecessary();
+        }
     }
 
     private void flushIfNecessary()
@@ -565,6 +621,35 @@ public class CassandraAppender extends AppenderSkeleton
             }
         }
 
+        //Thrift KsDef's won't include CQL3 column families, so check for a CQL3 version.
+        //If we find one we'll write to that (creating it would cause an error anyway)
+        //but if not we'll just stick to the old Thrift path.
+        if(!exists)
+        {
+            try
+            {
+                String query = String.format("%s keyspace_name = \'%s\' AND columnfamily_name = \'%s\';",
+                                             "SELECT columnfamily_name from system.schema_columnfamilies WHERE",
+                                             keyspaceName, columnFamily);
+
+                CqlResult result = client.execute_cql3_query(toByteBuffer(query), Compression.NONE,
+                                                             ConsistencyLevel.ONE);
+
+                //Cql3
+                if (result.rows != null && !result.rows.isEmpty())
+                {
+                    useCql3 = true;
+                    return true;
+                }
+            }
+            catch (Exception e)
+            {
+                //lets hope we aren't here
+                System.out.println(e.toString());
+            }
+
+        }
+
         return exists;
     }
 
@@ -740,5 +825,85 @@ public class CassandraAppender extends AppenderSkeleton
         if (b.charAt(0) == '\"' && b.charAt(b.length() - 1) == '\"')
             b = b.substring(1, b.length() - 1);
         return b;
+    }
+
+    //This is not really an optimal solution: what we'd like to do is use the thrift client's
+    //execute_prepared_cql3_query and just dump stuff to bytebuffers (like the base thrift code is doing).
+    //Unfortunately, many of the fields can be null, and we don't want to waste storage space on them,
+    //so we just build a string query incrementally.  This class builds a simple
+    //INSERT into KS.CF (x y z) VALUES (xval yval zval) query, handles the formatting, and ignores
+    //null values.
+    private class Cql3QueryBuilder
+    {
+        StringBuilder vars = new StringBuilder();
+        StringBuilder vals = new StringBuilder();
+        boolean first = true;
+
+        public Cql3QueryBuilder(String ks, String cf)
+        {
+            vars.append("INSERT into \"");
+            vars.append(ks);
+            vars.append("\".\"");
+            vars.append(cf);
+            vars.append("\" (");
+            vals.append("VALUES(");
+        }
+
+        public void add(String var, UUID val)
+        {
+            push(var, val.toString(), false);
+        }
+
+        public void add(String var, long val)
+        {
+            push(var, Long.toString(val), false);
+        }
+
+        public void add(String var, String val)
+        {
+            if(val == null)
+            {
+                return;
+            }
+
+            if(val.indexOf('\'') >= 0)
+            {
+                val = val.replace("\'", "\'\'");
+            }
+
+            push(var, val, true);
+        }
+
+        private void push(String var, String val, boolean escape)
+        {
+            if(!first)
+            {
+                vars.append(", ");
+                vals.append(", ");
+            }
+
+            first = false;
+
+            if(escape)
+            {
+                vals.append('\'');
+            }
+
+            vars.append(var);
+            vals.append(val);
+
+            if(escape)
+            {
+                vals.append('\'');
+            }
+        }
+
+        String build()
+        {
+            vars.append(") ");
+            vals.append(");");
+
+            return vars.toString() + vals.toString();
+        }
     }
 }
